@@ -6,20 +6,23 @@ trigger:
       - main
 
 pool:
-  name: Default   # uses your VENKAT agent automatically
+  name: Default
 
 variables:
   imageName: 'venkateshs111/springboot-hello-azure-devops'
   dockerRegistryServiceConnection: 'dockerhub-connection'
   jarName: 'springboot-hello-1.0.0.jar'
+  imageTag: '$(Build.BuildId)'
+  devContainerName: 'springboot-app-dev'
+  qaContainerName: 'springboot-app-qa'
+  prodContainerName: 'springboot-app-prod'
+  devPort: '8080'
+  qaPort: '8081'
+  prodPort: '8082'
 
 stages:
-
-# =========================
-# BUILD STAGE
-# =========================
 - stage: Build
-  displayName: Build Stage
+  displayName: Build
   jobs:
   - job: MavenBuild
     displayName: Maven Build
@@ -27,56 +30,52 @@ stages:
     - checkout: self
 
     - task: Maven@3
-      displayName: 'Build with Maven'
+      displayName: Build with Maven
       inputs:
-        mavenPomFile: 'pom.xml'
+        mavenPOMFile: 'pom.xml'
         goals: 'clean package'
         javaHomeOption: 'JDKVersion'
         jdkVersionOption: '1.8'
 
     - task: CopyFiles@2
-      displayName: 'Copy JAR'
+      displayName: Copy JAR
       inputs:
         SourceFolder: '$(System.DefaultWorkingDirectory)/target'
         Contents: '$(jarName)'
         TargetFolder: '$(Build.ArtifactStagingDirectory)'
 
     - task: PublishPipelineArtifact@1
-      displayName: 'Publish Artifact'
+      displayName: Publish JAR Artifact
       inputs:
         targetPath: '$(Build.ArtifactStagingDirectory)'
         artifactName: 'app-jar'
         publishLocation: 'pipeline'
 
-
-# =========================
-# DOCKER BUILD & PUSH
-# =========================
 - stage: Docker
-  displayName: Docker Build & Push
+  displayName: Docker Build And Push
   dependsOn: Build
   jobs:
   - job: DockerBuildPush
-    displayName: Docker Build and Push
+    displayName: Build And Push Docker Image
     steps:
     - checkout: self
 
     - task: DownloadPipelineArtifact@2
-      displayName: 'Download JAR'
+      displayName: Download JAR Artifact
       inputs:
         buildType: 'current'
         artifactName: 'app-jar'
         targetPath: '$(Pipeline.Workspace)/app-jar'
 
     - task: CopyFiles@2
-      displayName: 'Copy JAR to target folder'
+      displayName: Restore JAR Into Docker Context
       inputs:
         SourceFolder: '$(Pipeline.Workspace)/app-jar'
         Contents: '$(jarName)'
         TargetFolder: '$(Build.SourcesDirectory)/target'
 
     - task: Docker@2
-      displayName: 'Build and Push Docker Image'
+      displayName: Build And Push Docker Image
       inputs:
         containerRegistry: '$(dockerRegistryServiceConnection)'
         repository: '$(imageName)'
@@ -84,28 +83,95 @@ stages:
         Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
         buildContext: '$(Build.SourcesDirectory)'
         tags: |
-          $(Build.BuildId)
+          $(imageTag)
           latest
 
-
-# =========================
-# DEPLOY STAGE (WINDOWS SAFE)
-# =========================
-- stage: Deploy
-  displayName: Deploy to Local (VENKAT)
+- stage: Dev
+  displayName: Deploy To Dev
   dependsOn: Docker
   jobs:
-  - job: RunContainer
-    displayName: Run Docker Container
+  - deployment: DeployDev
+    displayName: Deploy Docker Image To Dev
+    environment: 'dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - powershell: |
+              Write-Host "Deploying $(imageName):$(imageTag) to DEV"
+              docker pull $(imageName):$(imageTag)
+
+              docker rm -f $(devContainerName)
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "DEV container did not exist."
+              }
+
+              docker run -d -p $(devPort):8080 --name $(devContainerName) $(imageName):$(imageTag)
+            displayName: Run DEV Container
+
+- stage: QA
+  displayName: Deploy To QA
+  dependsOn: Dev
+  jobs:
+  - deployment: DeployQA
+    displayName: Deploy Docker Image To QA
+    environment: 'qa'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - powershell: |
+              Write-Host "Deploying $(imageName):$(imageTag) to QA"
+              docker pull $(imageName):$(imageTag)
+
+              docker rm -f $(qaContainerName)
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "QA container did not exist."
+              }
+
+              docker run -d -p $(qaPort):8080 --name $(qaContainerName) $(imageName):$(imageTag)
+            displayName: Run QA Container
+
+- stage: ProdApproval
+  displayName: Prod Approval
+  dependsOn: QA
+  jobs:
+  - job: WaitForApproval
+    displayName: Manual Validation Before Prod
+    pool: server
     steps:
-    - script: |
-        echo Deploying container on VENKAT...
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440
+      inputs:
+        instructions: 'Approve this step to deploy the current Docker image to PROD.'
+        notifyUsers: ''
+        onTimeout: 'reject'
 
-        docker pull $(imageName):latest
+- stage: Prod
+  displayName: Deploy To Prod
+  dependsOn: ProdApproval
+  jobs:
+  - deployment: DeployProd
+    displayName: Deploy Docker Image To Prod
+    environment: 'prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
 
-        docker stop springboot-app 2>nul
-        docker rm springboot-app 2>nul
+          - powershell: |
+              Write-Host "Deploying $(imageName):$(imageTag) to PROD"
+              docker pull $(imageName):$(imageTag)
 
-        docker run -d -p 8080:8080 --name springboot-app $(imageName):latest
+              docker rm -f $(prodContainerName)
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "PROD container did not exist."
+              }
 
-      displayName: 'Run Docker Container'
+              docker run -d -p $(prodPort):8080 --name $(prodContainerName) $(imageName):$(imageTag)
+            displayName: Run PROD Container
